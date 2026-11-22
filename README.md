@@ -1,11 +1,11 @@
 # Capstone AI RAG API
 
-A modular FastAPI service that answers user questions by querying a vector database running at `http://localhost:8000` and synthesizing a response from the most relevant retrieved documents.
+A modular FastAPI service that answers user questions by querying the Chroma DB collections created by the customs RAG notebook at `http://localhost:8000` and synthesizing a response from the most relevant retrieved documents.
 
 ## Features
 
 - FastAPI-based REST API
-- Vector DB client with fallback search endpoint detection
+- Vector DB client that uses the notebook's `BAAI/bge-large-en-v1.5` embeddings against the live Chroma collections (`itc_tariff_items`, `itc_headings`, `itc_rulings`, `itc_gris`)
 - Modular RAG pipeline with separate services for vector search and answer generation
 - Configurable collection and result count
 - Health endpoint and query endpoint
