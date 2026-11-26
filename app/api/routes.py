@@ -29,9 +29,7 @@ def ask_question(
     try:
         return rag_service.answer_query(
             query=payload.query,
-            collection=payload.collection,
-            top_k=payload.top_k,
-            filters=payload.filters,
+            filters=payload.filters
         )
     except VectorDBConnectionError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc

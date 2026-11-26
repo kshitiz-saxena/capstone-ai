@@ -12,21 +12,17 @@ class AnswerGenerator:
     def __init__(self, gemini_api_key: str | None = None) -> None:
         self.gemini_api_key = gemini_api_key or os.getenv("GEMINI_API_KEY") or os.getenv("OPENAI_API_KEY")
 
-    def generate(self, query: str, documents: list[dict[str, Any]]) -> str:
+    def generate(self, query: str, context: str) -> str:
         if self.gemini_api_key:
-            return self._generate_with_gemini(query, documents)
-        return self._generate_locally(query, documents)
+            return self._generate_with_gemini(query, context)
+        return self._generate_locally(query, context)
 
-    def _generate_locally(self, query: str, documents: list[dict[str, Any]]) -> str:
-        if not documents:
+    def _generate_locally(self, query: str, context: str) -> str:
+        if not context:
             return "I could not find relevant information for that question in the vector database."
 
         relevant_snippets = []
-        for document in documents[:5]:
-            content = document.get("content") or ""
-            if content:
-                relevant_snippets.append(content.strip())
-
+        relevant_snippets = context.split("\n\n")[:5]
         context = "\n\n".join(relevant_snippets)
         if not context:
             return "I found matching records, but their content is empty or unavailable."
@@ -38,18 +34,27 @@ class AnswerGenerator:
         )
         return answer
 
-    def _generate_with_gemini(self, query: str, documents: list[dict[str, Any]]) -> str:
-        prompt = "You are a helpful assistant. Answer the user's question using only the provided context."
-        context = "\n\n".join(
-            (document.get("content") or "").strip() for document in documents if document.get("content")
+    def _generate_with_gemini(self, query: str, context: str) -> str:
+        
+        system_instruction = (
+            "You are a precise document assistant. "
+            "Answer the user's question using ONLY the provided context. "
+            "If the answer is not in the context, say: "
+            "'I don't know based on the provided document.' "
+            "Be concise and cite the Section and Chapter number where relevant."
         )
+        
+        user_msg = f"""Context:
+            {context}
+
+            Question: {query}"""
 
         if not context:
-            return self._generate_locally(query, documents)
+            return self._generate_locally(query, context)
 
         payload = {
-            "system_instruction": {"parts": [{"text": prompt}]},
-            "contents": [{"parts": [{"text": f"Question: {query}\n\nContext:\n{context}"}]}],
+            "system_instruction": {"parts": [{"text": system_instruction}]},
+            "contents": [{"parts": [{"text": user_msg}]}],
             "generationConfig": {"temperature": 0.2},
         }
 

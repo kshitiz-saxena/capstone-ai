@@ -1,32 +1,89 @@
 from __future__ import annotations
 
+import chromadb
+
 from typing import Any
 from urllib.parse import urlparse
 
-import requests
-
-try:
-    import chromadb
-except ImportError:  # pragma: no cover - optional dependency for Chroma-backed vector stores
-    chromadb = None
-
-from app.config import DEFAULT_COLLECTION, VECTOR_DB_BASE_URL
+from app.config import DEFAULT_COLLECTION, EMBEDDING_MODEL_NAME, VECTOR_DB_BASE_URL
 from app.core.errors import VectorDBConnectionError
+
+from sentence_transformers import SentenceTransformer
+
+DEFAULT_CONTENT_FILTER: dict[str, Any] = {
+    "type": {"$in": ["text", "table"]}
+}
 
 
 class VectorDBClient:
-    """Small client for querying a local vector database over HTTP."""
-
+    """Query Chroma using the same embedding model that indexed the collection."""
     def __init__(
         self,
         base_url: str = VECTOR_DB_BASE_URL,
         default_collection: str | None = DEFAULT_COLLECTION,
+        embedding_model_name: str = EMBEDDING_MODEL_NAME,
         timeout: float = 10.0,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.default_collection = default_collection
+        self.embedding_model_name = embedding_model_name
         self.timeout = timeout
         self._chroma_client = self._create_chroma_client()
+        self._embedding_model: Any | None = None
+
+    def search(
+        self,
+        query: str,
+        collection: str | None = None,
+        top_k: int = 5,
+        filters: dict[str, Any] | None = None,
+    ) -> list[dict[str, Any]]:
+        target_collection = collection or self.default_collection
+        if not target_collection:
+            raise VectorDBConnectionError("No Chroma collection was configured.")
+        if self._chroma_client is None:
+            raise VectorDBConnectionError("ChromaDB client is unavailable.")
+
+        query_embedding = self._embed_query(query)
+        resolved_filters = filters if filters is not None else DEFAULT_CONTENT_FILTER.copy()
+
+        try:
+            collection_handle = self._chroma_client.get_collection(target_collection)
+            results = collection_handle.query(
+                query_embeddings=[query_embedding],
+                n_results=min(top_k, 10),
+                include=["documents", "metadatas", "distances"],
+                where=resolved_filters,
+            )
+        except Exception as exc:
+            raise VectorDBConnectionError(
+                f"Unable to query Chroma collection '{target_collection}': {exc}"
+            ) from exc
+
+        return self._normalize_chroma_response(results)
+
+    def _embed_query(self, query: str) -> list[float]:
+        model = self._get_embedding_model()
+        try:
+            embedding = model.encode(query, show_progress_bar=False)
+            return embedding.tolist() if hasattr(embedding, "tolist") else list(embedding)
+        except Exception as exc:
+            raise VectorDBConnectionError(
+                f"Unable to embed query with '{self.embedding_model_name}': {exc}"
+            ) from exc
+
+    def _get_embedding_model(self) -> Any:
+        if self._embedding_model is not None:
+            return self._embedding_model
+
+        try:
+            self._embedding_model = SentenceTransformer(self.embedding_model_name)
+        except Exception as exc:
+            raise VectorDBConnectionError(
+                f"Unable to load embedding model '{self.embedding_model_name}': {exc}"
+            ) from exc
+
+        return self._embedding_model
 
     def _create_chroma_client(self) -> Any | None:
         if chromadb is None:
@@ -41,98 +98,12 @@ class VectorDBClient:
                 tenant="default_tenant",
                 database="default_database",
             )
-        except Exception:  # pragma: no cover - connection is validated in real integration
+        except Exception:
             return None
 
-    def search(
-        self,
-        query: str,
-        collection: str | None = None,
-        top_k: int = 5,
-        filters: dict[str, Any] | None = None,
+    def _normalize_chroma_response(
+        self, data: dict[str, Any]
     ) -> list[dict[str, Any]]:
-        target_collection = collection or self.default_collection
-
-        if self._chroma_client is not None and target_collection:
-            try:
-                collection_handle = self._chroma_client.get_collection(target_collection)
-                result = collection_handle.query(
-                    query_texts=[query],
-                    n_results=min(top_k, 10),
-                    include=["documents", "metadatas", "distances"],
-                    where=filters,
-                )
-                return self._normalize_chroma_response(result)
-            except Exception as exc:  # pragma: no cover - exercised via real Chroma server integration
-                last_error = exc
-            else:
-                return []
-        else:
-            last_error = None
-
-        payload: dict[str, Any] = {
-            "query": query,
-            "top_k": top_k,
-            "filter": filters or {},
-        }
-        if target_collection:
-            payload["collection"] = target_collection
-
-        for endpoint in self._candidate_endpoints(target_collection):
-            try:
-                response = requests.post(endpoint, json=payload, timeout=self.timeout)
-            except requests.RequestException as exc:  # pragma: no cover - exercised via live integration
-                last_error = exc
-                continue
-
-            if response.status_code in {404, 405}:
-                last_error = RuntimeError(f"Endpoint not found: {endpoint}")
-                continue
-
-            if response.status_code >= 400:
-                last_error = RuntimeError(
-                    f"Vector DB request failed for {endpoint}: {response.status_code} {response.text}"
-                )
-                continue
-
-            try:
-                data = response.json()
-            except ValueError as exc:
-                last_error = exc
-                continue
-
-            normalized_documents = self._normalize_response(data)
-            if normalized_documents:
-                return normalized_documents
-
-            return []
-
-        raise VectorDBConnectionError(
-            "Unable to reach the vector database. "
-            f"Checked endpoints: {', '.join(self._candidate_endpoints(target_collection))}. "
-            f"Last error: {last_error}"
-        )
-
-    def _candidate_endpoints(self, collection: str | None) -> list[str]:
-        endpoints: list[str] = [
-            f"{self.base_url}/query",
-            f"{self.base_url}/search",
-            f"{self.base_url}/api/v1/query",
-            f"{self.base_url}/api/v1/search",
-        ]
-
-        if collection:
-            endpoints = [
-                f"{self.base_url}/collections/{collection}/query",
-                f"{self.base_url}/collections/{collection}/search",
-                f"{self.base_url}/{collection}/query",
-                f"{self.base_url}/{collection}/search",
-                *endpoints,
-            ]
-
-        return endpoints
-
-    def _normalize_chroma_response(self, data: dict[str, Any]) -> list[dict[str, Any]]:
         documents = data.get("documents") or []
         metadatas = data.get("metadatas") or []
         distances = data.get("distances") or []
@@ -152,57 +123,13 @@ class VectorDBClient:
                     {
                         "id": doc_id,
                         "content": content,
-                        "score": None if distance is None else max(0.0, 1.0 - float(distance)),
+                        "score": (
+                            None
+                            if distance is None
+                            else max(0.0, 1.0 - float(distance))
+                        ),
                         "metadata": metadata,
                     }
                 )
-
-        return normalized
-
-    def _normalize_response(self, data: Any) -> list[dict[str, Any]]:
-        if isinstance(data, list):
-            items = data
-        elif isinstance(data, dict):
-            for key in ("results", "matches", "documents", "data", "items"):
-                if key in data:
-                    items = data[key]
-                    break
-            else:
-                return []
-        else:
-            return []
-
-        normalized: list[dict[str, Any]] = []
-        for item in items:
-            if isinstance(item, str):
-                normalized.append({"content": item})
-                continue
-
-            if not isinstance(item, dict):
-                continue
-
-            content = (
-                item.get("content")
-                or item.get("text")
-                or item.get("page_content")
-                or item.get("chunk")
-            )
-            metadata = item.get("metadata") or {}
-            doc_payload = item.get("document")
-            if isinstance(doc_payload, dict):
-                content = content or doc_payload.get("content") or doc_payload.get("text")
-                metadata = metadata or doc_payload.get("metadata") or {}
-
-            if isinstance(item.get("embedding"), list):
-                metadata["embedding_length"] = len(item["embedding"])
-
-            normalized.append(
-                {
-                    "id": item.get("id") or item.get("doc_id") or item.get("uuid"),
-                    "content": str(content) if content is not None else "",
-                    "score": item.get("score"),
-                    "metadata": metadata,
-                }
-            )
 
         return normalized

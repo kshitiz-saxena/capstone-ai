@@ -22,18 +22,20 @@ class RAGService:
     def answer_query(
         self,
         query: str,
-        collection: str | None = None,
-        top_k: int = 5,
         filters: dict[str, Any] | None = None,
     ) -> QueryResponse:
-        documents = self.vector_db_client.search(
+        chunks = self.vector_db_client.search(
             query=query,
-            collection=collection,
-            top_k=top_k,
+            collection=DEFAULT_COLLECTION,
+            top_k=5,
             filters=filters,
         )
+        
+        context = self._create_context(chunks)
+        
+        print("Created context:", context)
 
-        answer = self.answer_generator.generate(query, documents)
+        answer = self.answer_generator.generate(query, context)
         source_documents = [
             SourceDocument(
                 id=document.get("id"),
@@ -41,13 +43,22 @@ class RAGService:
                 score=document.get("score"),
                 metadata=document.get("metadata"),
             )
-            for document in documents
+            for document in chunks
         ]
 
-        resolved_collection = collection or getattr(self.vector_db_client, "default_collection", None)
+        resolved_collection = DEFAULT_COLLECTION or getattr(self.vector_db_client, "default_collection", None)
         return QueryResponse(
             answer=answer,
-            query=query,
-            collection=resolved_collection,
-            sources=source_documents,
+            query=query
         )
+        
+    def _create_context(self, chunks: list[dict[str, Any]]) -> str:
+        parts = []
+        for i, c in enumerate(chunks, 1):
+            m = c['metadata']
+            label = (
+                f'[{i}] [{m["type"].upper()} | section {m["section"]} | chapter {m["chapter"]} | '
+                f'score {c["score"]}]'
+            )
+            parts.append(f'{label}\n{c["content"]}')
+        return '\n\n'.join(parts)
