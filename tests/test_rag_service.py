@@ -1,8 +1,9 @@
+from fastapi.testclient import TestClient
+
+from app.api.routes import get_integrated_rag_agent, get_rag_service
 from app.main import app
-from app.api.routes import get_rag_service
 from app.services.rag_service import RAGService
 from app.services.vector_db_client import VectorDBClient
-from fastapi.testclient import TestClient
 
 
 class FakeVectorDBClient:
@@ -10,23 +11,36 @@ class FakeVectorDBClient:
         return [
             {
                 "id": "doc-1",
-                "content": "Retrieval-Augmented Generation combines search and generation to answer questions using relevant documents.",
+                "content": "RAG combines retrieval and generation to answer with grounded context.",
                 "score": 0.98,
-                "metadata": {"source": "knowledge-base"},
+                "metadata": {"type": "text", "section": "A", "chapter": "1"},
             }
         ]
 
 
 class FakeAnswerGenerator:
-    def generate(self, query, documents):
-        return f"Using the retrieved context, the answer is: {documents[0]['content']}"
+    def generate(self, query, context):
+        return f"Answer for '{query}' based on context: {context}"
 
 
-app.dependency_overrides[get_rag_service] = lambda: RAGService(
-    vector_db_client=FakeVectorDBClient(),
-    answer_generator=FakeAnswerGenerator(),
-)
+class FakeIntegratedRAGAgent:
+    def process_message(self, session_id, message, file_paths=None):
+        return {"reply": f"stateful-reply::{session_id}::{message}"}
 
+
+def _override_rag_service():
+    return RAGService(
+        vector_db_client=FakeVectorDBClient(),
+        answer_generator=FakeAnswerGenerator(),
+    )
+
+
+def _override_integrated_agent():
+    return FakeIntegratedRAGAgent()
+
+
+app.dependency_overrides[get_rag_service] = _override_rag_service
+app.dependency_overrides[get_integrated_rag_agent] = _override_integrated_agent
 client = TestClient(app)
 
 
@@ -36,16 +50,28 @@ def test_health_endpoint():
     assert response.json()["status"] == "ok"
 
 
-def test_query_endpoint():
+def test_query_endpoint_without_session_id_uses_standard_rag():
     response = client.post(
         "/api/v1/query",
-        json={"query": "What is RAG?", "top_k": 2},
+        json={"query": "What is RAG?"},
     )
 
     assert response.status_code == 200
     payload = response.json()
-    assert "RAG" in payload["answer"] or "retrieved context" in payload["answer"]
-    assert len(payload["sources"]) == 1
+    assert payload["query"] == "What is RAG?"
+    assert "Answer for 'What is RAG?'" in payload["answer"]
+
+
+def test_query_endpoint_with_session_id_uses_stateful_agent():
+    response = client.post(
+        "/api/v1/query",
+        json={"query": "Classify this valve", "session_id": "thread-123"},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["query"] == "Classify this valve"
+    assert payload["answer"] == "stateful-reply::thread-123::Classify this valve"
 
 
 def test_vector_db_client_queries_with_embedding(monkeypatch):
@@ -70,11 +96,11 @@ def test_vector_db_client_queries_with_embedding(monkeypatch):
             assert name == "hs_code_rag"
             return FakeCollection()
 
-    client = VectorDBClient(default_collection="hs_code_rag")
-    monkeypatch.setattr(client, "_chroma_client", FakeChromaClient())
-    monkeypatch.setattr(client, "_get_embedding_model", lambda: FakeEmbeddingModel())
+    vector_client = VectorDBClient(default_collection="hs_code_rag")
+    monkeypatch.setattr(vector_client, "_chroma_client", FakeChromaClient())
+    monkeypatch.setattr(vector_client, "_get_embedding_model", lambda: FakeEmbeddingModel())
 
-    documents = client.search("polo horses")
+    documents = vector_client.search("polo horses")
 
     assert documents[0]["id"] == "item-1"
     assert documents[0]["content"] == "Horses for polo"
